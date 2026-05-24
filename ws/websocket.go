@@ -128,6 +128,7 @@ type WebSocket struct {
 	closeC             chan websocket.CloseError // used to gracefully close a websocket connection.
 	forceCloseC        chan error                // used by the readPump to notify a forcefully closed connection to the writePump.
 	pingMessage        chan []byte
+	done               chan struct{} // closed exactly once by cleanup; signals in-flight Write/StopConnection callers to bail.
 	tlsConnectionState *tls.ConnectionState
 }
 
@@ -386,6 +387,7 @@ func (server *Server) AddHttpHandler(listenPath string, handler func(w http.Resp
 }
 
 func (server *Server) Start(port int, listenPath string) {
+	log.Infof("ocpp-go fork ertankara/ocpp-go v0.19.0-zebra1: connMutex deadlock fix active")
 	server.connMutex.Lock()
 	server.connections = make(map[string]*WebSocket)
 	server.connMutex.Unlock()
@@ -447,28 +449,48 @@ func (server *Server) StopConnection(id string, closeError websocket.CloseError)
 		return fmt.Errorf("couldn't stop websocket connection. No connection with id %s is open", id)
 	}
 	log.Debugf("sending stop signal for websocket %s", ws.ID())
-	ws.closeC <- closeError
-	return nil
+	select {
+	case ws.closeC <- closeError:
+		return nil
+	case <-ws.done:
+		return fmt.Errorf("couldn't stop websocket connection %s: already closed", id)
+	case <-time.After(server.timeoutConfig.WriteWait):
+		return fmt.Errorf("couldn't stop websocket connection %s: closeC full (timeout)", id)
+	}
 }
 
 func (server *Server) stopConnections() {
 	server.connMutex.RLock()
-	defer server.connMutex.RUnlock()
+	snapshot := make([]*WebSocket, 0, len(server.connections))
 	for _, conn := range server.connections {
-		conn.closeC <- websocket.CloseError{Code: websocket.CloseNormalClosure, Text: ""}
+		snapshot = append(snapshot, conn)
+	}
+	server.connMutex.RUnlock()
+	for _, conn := range snapshot {
+		select {
+		case conn.closeC <- websocket.CloseError{Code: websocket.CloseNormalClosure, Text: ""}:
+		case <-conn.done:
+		case <-time.After(server.timeoutConfig.WriteWait):
+		}
 	}
 }
 
 func (server *Server) Write(webSocketId string, data []byte) error {
 	server.connMutex.RLock()
-	defer server.connMutex.RUnlock()
 	ws, ok := server.connections[webSocketId]
+	server.connMutex.RUnlock()
 	if !ok {
 		return fmt.Errorf("couldn't write to websocket. No socket with id %v is open", webSocketId)
 	}
 	log.Debugf("queuing data for websocket %s", webSocketId)
-	ws.outQueue <- data
-	return nil
+	select {
+	case ws.outQueue <- data:
+		return nil
+	case <-ws.done:
+		return fmt.Errorf("couldn't write to websocket %s: connection closed", webSocketId)
+	case <-time.After(server.timeoutConfig.WriteWait):
+		return fmt.Errorf("couldn't write to websocket %s: outQueue full (timeout)", webSocketId)
+	}
 }
 
 func (server *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
@@ -535,6 +557,7 @@ out:
 		closeC:             make(chan websocket.CloseError, 1),
 		forceCloseC:        make(chan error, 1),
 		pingMessage:        make(chan []byte, 1),
+		done:               make(chan struct{}),
 		tlsConnectionState: r.TLS,
 	}
 	log.Debugf("upgraded websocket connection for %s from %s", id, conn.RemoteAddr().String())
@@ -618,14 +641,8 @@ func (server *Server) writePump(ws *WebSocket) {
 
 	for {
 		select {
-		case data, ok := <-ws.outQueue:
+		case data := <-ws.outQueue:
 			_ = conn.SetWriteDeadline(time.Now().Add(server.timeoutConfig.WriteWait))
-			if !ok {
-				// Unexpected closed queue, should never happen
-				server.error(fmt.Errorf("output queue for socket %v was closed, forcefully closing", ws.id))
-				// Don't invoke cleanup
-				return
-			}
 			// Send data
 			err := conn.WriteMessage(websocket.TextMessage, data)
 			if err != nil {
@@ -673,9 +690,8 @@ func (server *Server) writePump(ws *WebSocket) {
 // From this moment onwards, no new messages may be sent.
 func (server *Server) cleanupConnection(ws *WebSocket) {
 	_ = ws.connection.Close()
+	close(ws.done)
 	server.connMutex.Lock()
-	close(ws.outQueue)
-	close(ws.closeC)
 	delete(server.connections, ws.id)
 	server.connMutex.Unlock()
 	log.Infof("closed connection to %s", ws.ID())
@@ -1000,10 +1016,9 @@ func (client *Client) cleanup() {
 	client.setConnected(false)
 	ws := client.webSocket
 	_ = ws.connection.Close()
+	close(ws.done)
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
-	close(ws.outQueue)
-	close(ws.closeC)
 }
 
 func (client *Client) handleReconnection() {
@@ -1056,8 +1071,15 @@ func (client *Client) Write(data []byte) error {
 		return fmt.Errorf("client is currently not connected, cannot send data")
 	}
 	log.Debugf("queuing data for server")
-	client.webSocket.outQueue <- data
-	return nil
+	ws := client.webSocket
+	select {
+	case ws.outQueue <- data:
+		return nil
+	case <-ws.done:
+		return fmt.Errorf("cannot send data: connection closed")
+	case <-time.After(client.timeoutConfig.WriteWait):
+		return fmt.Errorf("cannot send data: outQueue full (timeout)")
+	}
 }
 
 func (client *Client) StartWithRetries(urlStr string) {
@@ -1110,6 +1132,7 @@ func (client *Client) Start(urlStr string) error {
 		outQueue:           make(chan []byte, 1),
 		closeC:             make(chan websocket.CloseError, 1),
 		forceCloseC:        make(chan error, 1),
+		done:               make(chan struct{}),
 		tlsConnectionState: resp.TLS,
 	}
 	log.Infof("connected to server as %s", id)

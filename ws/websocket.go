@@ -387,7 +387,7 @@ func (server *Server) AddHttpHandler(listenPath string, handler func(w http.Resp
 }
 
 func (server *Server) Start(port int, listenPath string) {
-	log.Infof("ocpp-go fork ertankara/ocpp-go v0.19.0-zebra1: connMutex deadlock fix active")
+	fmt.Println("ocpp-go fork ertankara/ocpp-go v0.19.0-zebra2: connMutex deadlock fix active")
 	server.connMutex.Lock()
 	server.connections = make(map[string]*WebSocket)
 	server.connMutex.Unlock()

@@ -435,10 +435,19 @@ func (d *DefaultServerDispatcher) CreateClient(clientID string) {
 
 func (d *DefaultServerDispatcher) DeleteClient(clientID string) {
 	d.queueMap.Remove(clientID)
-	if d.IsRunning() {
-		d.mutex.RLock()
-		d.requestChannel <- clientID
-		d.mutex.RUnlock()
+	// Snapshot the channel/stop signal under the lock, then send WITHOUT holding
+	// it. Sending while holding RLock lets a full requestChannel pin the read
+	// lock; a queued writer (e.g. serverState.GetClientState, which shares this
+	// mutex) then starves every subsequent RLock — including the pump's own —
+	// and the dispatcher deadlocks, leaking a goroutine per connect/disconnect.
+	d.mutex.RLock()
+	running, ch, stoppedC := d.running, d.requestChannel, d.stoppedC
+	d.mutex.RUnlock()
+	if running && ch != nil {
+		select {
+		case ch <- clientID:
+		case <-stoppedC:
+		}
 	}
 }
 
@@ -465,9 +474,16 @@ func (d *DefaultServerDispatcher) SendRequest(clientID string, req RequestBundle
 	if err := q.Push(req); err != nil {
 		return err
 	}
+	// Send without holding the lock — see DeleteClient for the deadlock this avoids.
 	d.mutex.RLock()
-	d.requestChannel <- clientID
+	ch, stoppedC := d.requestChannel, d.stoppedC
 	d.mutex.RUnlock()
+	if ch != nil {
+		select {
+		case ch <- clientID:
+		case <-stoppedC:
+		}
+	}
 	return nil
 }
 
@@ -610,11 +626,16 @@ func (d *DefaultServerDispatcher) waitForTimeout(clientID string, clientCtx clie
 	case <-clientCtx.ctx.Done():
 		err := clientCtx.ctx.Err()
 		if err == context.DeadlineExceeded {
-			// Timeout triggered, notifying messagePump
+			// Timeout triggered, notifying messagePump. Send without holding the
+			// lock — see DeleteClient for the deadlock this avoids.
 			d.mutex.RLock()
-			defer d.mutex.RUnlock()
-			if d.running {
-				d.timerC <- clientID
+			running, ch, stoppedC := d.running, d.timerC, d.stoppedC
+			d.mutex.RUnlock()
+			if running && ch != nil {
+				select {
+				case ch <- clientID:
+				case <-stoppedC:
+				}
 			}
 		} else {
 			log.Debugf("timeout canceled for %s", clientID)
